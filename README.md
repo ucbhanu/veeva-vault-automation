@@ -1,24 +1,20 @@
-# Veeva Vault - content factory Export PoC
+# Veeva Vault End-to-End Document Export Automation
 
 ## 1. Purpose
 
-This proof of concept supports the Veeva litigation export process. It can query Veeva for matching document records and download source content versions through the Vault API. Audit trails are obtained through Vault's bulk Document Export workflow, and PDF annotations are exported separately for each major and minor version.
+This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads available source files, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
 
 ```text
-Veeva query and source-version download
+Client version-list workbook
         ↓
-Manual bulk export of audit trails and per-version annotations
+Authenticate and download listed source versions
         ↓
-Organize all artifacts by document number
+Organize files by document number
         ↓
-Rename annotation files
-        ↓
-Create tracker and exceptions report
-        ↓
-Create one delivery ZIP
+Manifest, tracker, exceptions report, and delivery ZIP
 ```
 
-The API script does not modify Vault records or export annotations. The local organizer does not upload to Teams/SharePoint.
+The automation reads Vault content only; it does not modify Vault records. Audit trails, PDF annotations, and SharePoint upload remain separate operator-performed steps.
 
 ---
 
@@ -34,7 +30,7 @@ The source process requires the following activities:
 6. Rename annotation files using the document number and version number.
 7. Prepare the content for delivery to the customer’s designated Teams channel.
 
-The API downloader supports finding documents and downloading their source versions. Vault bulk export and annotation export remain user-performed steps, followed by local organization and packaging.
+The wrapper performs source-version download, local organization, and ZIP packaging from the version list. Vault bulk audit-trail and annotation exports remain user-performed steps when required by the request.
 
 ---
 
@@ -43,8 +39,9 @@ The API downloader supports finding documents and downloading their source versi
 ### Included
 
 - Authenticate to the configured Vault through the configured proxy.
-- Read matching document versions with major/minor version metadata and download source files into document-number folders.
+- Read exact document IDs and major/minor versions from the configured client workbook and download source files into document-number folders.
 - Write a manifest of downloaded source versions.
+- Resume interrupted downloads by reusing completed nonempty source files and checkpointing the manifest.
 - Read manual export files from the input folder, including subfolders.
 - Detect document numbers such as `DOC123456` and hyphenated Vault document numbers.
 - Classify files as **Source**, **Audit_Trail**, or **Annotations**.
@@ -104,7 +101,7 @@ The API downloader requires `requests`. The workbook-driven workflow also requir
 After extracting this package, keep the following files together:
 
 ```text
-veeva-vault-poc\
+veeva-vault-automation\
 ├── run_veeva_workflow.py
 ├── zip_creator.py
 ├── veeva_download.py
@@ -135,10 +132,10 @@ veeva-vault-poc\
 
 ### 6.1 Project folder
 
-The project folder is:
+The project folder is the repository root:
 
 ```text
-C:\Users\EFDDQ\Documents\GIT\automation\veeva-vault-poc
+<project-folder>
 ```
 
 ### 6.2 Input folder
@@ -146,7 +143,7 @@ C:\Users\EFDDQ\Documents\GIT\automation\veeva-vault-poc
 The API downloader writes source files into the configured input folder. Place the audit trail export and annotation PDFs in the same folder before organizing:
 
 ```text
-C:\Users\EFDDQ\Documents\GIT\automation\veeva-vault-poc\input
+input
 ```
 
 You may use another input-folder path by changing `VEEVA_INPUT_FOLDER` in `.env`.
@@ -156,7 +153,7 @@ You may use another input-folder path by changing `VEEVA_INPUT_FOLDER` in `.env`
 The script creates the output folder automatically. The recommended local output location is:
 
 ```text
-C:\Users\EFDDQ\Documents\GIT\automation\veeva-vault-poc\output
+output
 ```
 
 The client version-list workbook is kept under `reference/`. The configured input is `reference/US Litigation Activity_test document list_all_versions_repaired.xlsx`; it supplies the exact document IDs and major/minor versions to download.
@@ -165,17 +162,17 @@ The client version-list workbook is kept under `reference/`. The configured inpu
 
 ## 7. Manual Veeva preparation
 
-### API source download
+### Configure the end-to-end workflow
 
 Create a local `.env` file. Keep credentials and proxy secrets out of source control:
 
 ```text
-VEEVA_INPUT_FOLDER=C:\\Users\\<user>\\Documents\\veeva\\input
+VEEVA_INPUT_FOLDER=input
 VEEVA_REQUEST_ID=LIT-001
 VEEVA_OUTPUT_FOLDER=output
+VEEVA_VERSION_LIST=reference/<client-version-list.xlsx>
 VEEVA_USERNAME=<Veeva username>
 VEEVA_PASSWORD=<Veeva password>
-VEEVA_DOCUMENT_NAME_CONTAINS=<document name search text>
 AUTH_URL=https://<vault-host>/api/v26.2/auth
 VEEVA_API_VERSION=v26.2
 VEEVA_PROXY=http://<username>:<password>@<proxy-host>:<port>
@@ -183,16 +180,16 @@ VEEVA_PROXY=http://<username>:<password>@<proxy-host>:<port>
 
 Use `STAGE_AUTH_URL` instead of `AUTH_URL` when the approved Vault setup requires a separate Stage or discovery authentication URL. Do not set both unless the intended override is clear; `STAGE_AUTH_URL` takes precedence.
 
-Install the API dependency and run the downloader. A search phrase can be passed on the command line to override the `.env` value:
+Install dependencies and run the full workflow:
 
 ```powershell
-python -m pip install requests
-python veeva_download.py "document name"
+python -m pip install -r requirements.txt
+python run_veeva_workflow.py --clean
 ```
 
-The script authenticates, checks product metadata, queries `allversions documents`, downloads the source file for every matching major/minor version, and writes `veeva_download_manifest.csv` in the input folder. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
+The wrapper authenticates, validates metadata, downloads each workbook-listed version, checkpoints `veeva_download_manifest.csv`, organizes successful downloads, and creates a delivery ZIP. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
 
-The Vault query returns no document rows when the search text does not match. Choose the search text supplied by the business team and confirm the query results before proceeding.
+The name-search mode remains available through `veeva_download.py`, but the client-list workflow uses exact document IDs and versions from `VEEVA_VERSION_LIST`.
 
 ### Vault API reference
 
@@ -283,7 +280,7 @@ Before running `zip_creator.py`, complete these Vault steps:
 7. Rename each annotation `<Document Number>_v<Version Number>_Annotation.pdf`.
 8. Extract the bulk export and place it, plus annotation PDFs, under the input folder.
 
-The PoC expects individual files in the input folder. If Veeva gives you a ZIP file, manually extract that ZIP into:
+The organizer expects individual files in the input folder. If Veeva gives you a ZIP file, manually extract that ZIP into:
 
 ```text
 C:\Users\EFDDQ\Downloads\Veeva_Export
@@ -496,7 +493,7 @@ The uploader uses the SharePoint document library associated with the configured
 
 | Parameter | Example | Meaning |
 |---|---|---|
-| Input folder | `C:\Users\EFDDQ\Documents\GIT\automation\veeva-simple-poc\input` | API source downloads plus manually exported audit and annotation files. |
+| Input folder | `input` | API source downloads plus manually exported audit and annotation files. |
 | Request ID | `LIT-001` | Identifier for this litigation collection or delivery run. |
 | Output folder | `output` | Local root folder where the script creates results. |
 
@@ -515,7 +512,7 @@ DR-SCHOLLS-REQUEST-01
 For request ID `LIT-001`, the result is created here:
 
 ```text
-C:\Users\EFDDQ\Documents\GIT\automation\veeva-simple-poc\output\LIT-001
+output\LIT-001
 ```
 
 Example structure:
@@ -703,18 +700,11 @@ DOC123456_v2.1_annotation.pdf
 
 ### Existing output must be replaced
 
-The simple PoC copies files again if the same request ID is reused. To create a clean delivery, either:
-
-- use a new request ID, or
-- delete the existing request folder under `output` before running again.
-
-Example:
+The workflow replaces the delivery ZIP when the same request ID is reused. Use a new request ID to preserve earlier deliveries. To discard the current working set before a fresh run, use `--clean` after confirming the configured input and output folders can be removed:
 
 ```powershell
-Remove-Item -Recurse -Force ".\output\LIT-001"
+python run_veeva_workflow.py --clean
 ```
-
-Use this delete command only after confirming that the existing output is no longer needed.
 
 ---
 
@@ -744,29 +734,22 @@ Before manually uploading the final package to Teams/SharePoint, complete this c
 
 ---
 
-## 18. Future enhancements, not part of this PoC
+## 18. Operator-performed steps
 
-After this simple PoC is accepted, possible small enhancements include:
-
-1. Add a mapping CSV for files with inconsistent names.
-2. Add duplicate detection and checksum manifests.
-3. Process a Veeva-export ZIP directly instead of manually extracting it.
-4. Add a review screen or lightweight local user interface.
-5. Add approved Microsoft Graph upload to the Teams-connected SharePoint library.
-6. Add formal audit logging and restart support.
+The automation does not export audit trails or annotations and does not upload to SharePoint. Complete those tasks manually when required, then review the manifest, tracker, exceptions report, and ZIP before delivery.
 
 ---
 
 ## 19. Summary
 
-The PoC automates source-version retrieval and repetitive local organization while leaving the Vault bulk audit export, per-version annotation export, and final customer delivery under operator control:
+The end-to-end automation retrieves the source versions listed by the client and prepares a local delivery package. Audit trails, annotations, and final transfer remain under operator control:
 
 ```text
-Query Veeva and download source versions
+Read the client version list and download source versions
         ↓
-Bulk export audit trails and export annotations per version
+Optionally export audit trails and annotations manually
         ↓
-Place artifacts in the configured input folder and run zip_creator.py
+Organize input files and build a verified ZIP
         ↓
 Review tracker and exceptions
         ↓
