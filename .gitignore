@@ -1,0 +1,8 @@
+output/
+input/
+reference/
+.venv/
+__pycache__/
+.env
+*.pptx
+*.docx

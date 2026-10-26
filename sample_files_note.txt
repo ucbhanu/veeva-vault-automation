@@ -1,0 +1,11 @@
+Put your manually downloaded Veeva files in one folder.
+Example:
+C:\Users\EFDDQ\Downloads\Veeva_Export
+
+Recommended filenames:
+- DOC123456_v1.0_source.pdf
+- DOC123456_v1.0_annotation.pdf
+- DOC123456_v1.0_audit.csv
+- DOC234567_v2.1_source.msg
+
+The script looks for a document number like DOC123456 in the filename.
