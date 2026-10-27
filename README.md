@@ -385,12 +385,55 @@ The original file extension is retained. This allows the script to work with PDF
 
 Run these steps in **PowerShell** from the project folder. The downloader reads credentials and paths from `.env`; keep that file local and never paste its secrets into commands or logs.
 
+### 11.0 Quick start (execution steps)
+
+1. Open PowerShell in the project folder and create/activate the virtual environment:
+
+   ```powershell
+   cd <project-folder>\automation\veeva-vault-poc
+   python -m venv .venv
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+   .\.venv\Scripts\Activate.ps1
+   ```
+
+2. Create `.env` as shown in section 7 (including `VEEVA_PROXY`) and place the client workbook under `reference/`.
+
+3. Install dependencies through the corporate proxy. The proxy is read from `.env` so the credentials are not typed or echoed:
+
+   ```powershell
+   $px = ((Select-String -Path .env -Pattern '^VEEVA_PROXY=(.+)$').Matches[0].Groups[1].Value).Trim()
+   python -m pip install --isolated --proxy $px -r requirements.txt
+   Remove-Variable px
+   ```
+
+   `--isolated` ignores a global `pip.ini`; use it if pip fails with `Failed to parse: http://[user:passwd@]proxy.server:port`.
+
+4. Check free disk space, then run a smoke test with the first 10 workbook rows:
+
+   ```powershell
+   [math]::Round((Get-PSDrive C).Free/1GB,2)
+   python run_veeva_workflow.py --clean --start-index 1 --end-index 10
+   ```
+
+   Expected: `Authenticated`, `Metadata OK`, per-row `FAILED` lines only for Vault content/permission errors, and `ZIP integrity: OK`. The exit code is `1` whenever fewer than all workbook rows are downloaded, so a partial batch returns `1` even when it worked.
+
+5. Run the full list (in one go or in batches, see 11.1), then review `input/veeva_download_manifest.csv`, `output/<request-id>/collection_tracker.csv`, and `output/<request-id>/exceptions_report.csv`.
+
+6. Deliver `output/<request-id>/<request-id>_delivery.zip` after review (optionally with `sharepoint_upload.py`).
+
+Common download failures recorded in the manifest:
+
+| Vault message | Meaning |
+|---|---|
+| `INVALID_DATA: Content file does not exist` | The version has no source file in Vault. |
+| `INSUFFICIENT_ACCESS: Not authorized for permission [Download Source]` | The account lacks Download Source permission for that lifecycle/status (for example, Expired). |
+
 ### 11.1 Prepare and download source versions
 
 Set these values in `.env` before starting:
 
 ```text
-VEEVA_INPUT_FOLDER=C:\\Users\\<user>\\Documents\\veeva\\input
+VEEVA_INPUT_FOLDER=input
 VEEVA_REQUEST_ID=LIT-001
 VEEVA_OUTPUT_FOLDER=output
 VEEVA_VERSION_LIST=reference/US Litigation Activity_test document list_all_versions_repaired.xlsx
