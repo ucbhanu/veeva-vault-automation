@@ -2,19 +2,19 @@
 
 ## 1. Purpose
 
-This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads available source files, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
+This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads each version's source file and annotation PDF plus each document's audit trail, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
 
 ```text
 Client version-list workbook
         ↓
-Authenticate and download listed source versions
+Authenticate and download source, annotations, and audit trails
         ↓
 Organize files by document number
         ↓
 Manifest, tracker, exceptions report, and delivery ZIP
 ```
 
-The automation reads Vault content only; it does not modify Vault records. Audit trails, PDF annotations, and SharePoint upload remain separate operator-performed steps.
+The automation reads Vault content only; it does not modify Vault records. SharePoint upload remains a separate operator-performed step.
 
 ---
 
@@ -30,7 +30,7 @@ The source process requires the following activities:
 6. Rename annotation files using the document number and version number.
 7. Prepare the content for delivery to the customer’s designated Teams channel.
 
-The wrapper performs source-version download, local organization, and ZIP packaging from the version list. Vault bulk audit-trail and annotation exports remain user-performed steps when required by the request.
+The wrapper performs steps 2–6 through the Vault API from the version list, then packages the result. Creating the Veeva report and the final Teams delivery remain user-performed steps.
 
 ---
 
@@ -40,24 +40,24 @@ The wrapper performs source-version download, local organization, and ZIP packag
 
 - Authenticate to the configured Vault through the configured proxy.
 - Read exact document IDs and major/minor versions from the configured client workbook and download source files into document-number folders.
-- Write a manifest of downloaded source versions.
-- Resume interrupted downloads by reusing completed nonempty source files and checkpointing the manifest.
-- Read manual export files from the input folder, including subfolders.
+- Export each listed version's annotations as `<Document Number>_v<Version>_Annotation.pdf`.
+- Export each listed document's complete audit trail as `<Document Number>_audit_trail.csv`.
+- Write a manifest of source, annotation, and audit-trail results per version.
+- Resume interrupted downloads by reusing completed nonempty files and checkpointing the manifest.
+- Read additional manually exported files from the input folder, including subfolders.
 - Detect document numbers such as `DOC123456` and hyphenated Vault document numbers.
 - Classify files as **Source**, **Audit_Trail**, or **Annotations**.
 - Create one folder per document number.
 - Rename annotation files.
 - Create a collection tracker CSV.
-- Create an exceptions report CSV for files without a document number.
-- Create one ZIP package for the processed request.
+- Create an exceptions report CSV for files without a document number and for every source file, annotation, or audit trail that could not be downloaded.
+- Create one ZIP package for the processed request, including the download manifest.
 
 ### Not included
 
-- Automatic Veeva bulk export of audit trails.
-- Automatic PDF annotation export.
 - Automatic creation of Veeva reports.
 - PDF page splitting, OCR, or interpretation of document content.
-- Validation that the Veeva export is complete.
+- Validation that a downloaded annotation PDF actually contains annotations (Vault returns the viewable rendition with any annotations applied).
 - Checksum manifest generation.
 - Automatic Microsoft Teams / SharePoint upload.
 - Processing files that do not contain an identifiable document number unless manually renamed before execution.
@@ -85,9 +85,8 @@ Python 3.10.x
 
 ### Required permissions
 
-- Read access to the manually downloaded Veeva files.
 - Write access to your local project folder.
-- A Veeva account with API access and permission to retrieve the requested documents.
+- A Veeva account with API access and permission to download source, export annotations, and read audit trails for the requested documents (for example, Download Source for each lifecycle/status in scope).
 - Corporate network/proxy access and the corporate proxy root certificate trusted by Windows.
 
 ### Python dependencies
@@ -116,7 +115,7 @@ veeva-vault-automation\
 | File | Purpose |
 |---|---|
 | `zip_creator.py` | Main script that organizes files and creates the delivery ZIP. |
-| `veeva_download.py` | Authenticates, queries all matching major/minor source versions, and downloads files. |
+| `veeva_download.py` | Authenticates, downloads source versions, annotation PDFs, and audit trails. |
 | `run_veeva_workflow.py` | Runs workbook-driven download, organization, ZIP creation, and integrity validation. |
 | `reference/` | Client-supplied workbook listing the exact documents and versions to download. |
 | `requirements.txt` | Python dependencies for the downloader and workbook workflow. |
@@ -140,7 +139,7 @@ The project folder is the repository root:
 
 ### 6.2 Input folder
 
-The API downloader writes source files into the configured input folder. Place the audit trail export and annotation PDFs in the same folder before organizing:
+The API downloader writes source files, annotation PDFs, and audit trails into the configured input folder as `input/<document-number>/{Source,Annotations,Audit_Trail}/`. Any additional manually exported files may be placed in the same folder before organizing:
 
 ```text
 input
@@ -156,11 +155,11 @@ The script creates the output folder automatically. The recommended local output
 output
 ```
 
-The client version-list workbook is kept under `reference/`. The configured input is `reference/US Litigation Activity_test document list_all_versions_repaired.xlsx`; it supplies the exact document IDs and major/minor versions to download.
+The client version-list workbook is kept under `reference/`. `VEEVA_VERSION_LIST` selects the workbook; it supplies the exact document IDs and major/minor versions to download. For testing, use a small workbook (for example, 10 versions) rather than the full client list.
 
 ---
 
-## 7. Manual Veeva preparation
+## 7. Configuration and Vault API
 
 ### Configure the end-to-end workflow
 
@@ -187,13 +186,13 @@ python -m pip install -r requirements.txt
 python run_veeva_workflow.py --clean
 ```
 
-The wrapper authenticates, validates metadata, downloads each workbook-listed version, checkpoints `veeva_download_manifest.csv`, organizes successful downloads, and creates a delivery ZIP. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
+The wrapper authenticates, validates metadata, downloads each workbook-listed version's source and annotation PDF and each document's audit trail, checkpoints `veeva_download_manifest.csv`, organizes the files, and creates a delivery ZIP. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
 
 The name-search mode remains available through `veeva_download.py`, but the client-list workflow uses exact document IDs and versions from `VEEVA_VERSION_LIST`.
 
 ### Vault API reference
 
-The downloader uses Vault API `v26.2` and sends requests through `VEEVA_PROXY` when configured.
+The downloader uses Vault API `v26.2` and sends requests through `VEEVA_PROXY` when configured. At startup it prints `Using proxy from VEEVA_PROXY: <host>:<port>` (credentials are never printed).
 
 #### 1. Authenticate
 
@@ -259,6 +258,37 @@ input/<document_number>/Source/<document_number>_v<major>.<minor>_<filename>
 
 JSON responses from this endpoint are treated as Vault errors and recorded in `veeva_download_manifest.csv`. Common causes include missing content files and insufficient `Download Source` permission for the document lifecycle/status.
 
+#### 5. Export version annotations
+
+```http
+GET {vault_api_url}/v26.2/objects/documents/{id}/versions/{major}/{minor}/annotations/file
+Authorization: <sessionId>
+```
+
+The PDF is written to:
+
+```text
+input/<document_number>/Annotations/<document_number>_v<major>.<minor>_Annotation.pdf
+```
+
+A version without a viewable rendition returns `INVALID_DATA: Cannot find rendition [viewable_rendition__v]`; this is recorded in the manifest and exceptions report.
+
+#### 6. Export document audit trail
+
+```http
+GET {vault_api_url}/v26.2/objects/documents/{id}/audittrail?limit=1000
+Authorization: <sessionId>
+Accept: application/json
+```
+
+All pages are followed through `responseDetails.next_page` and written once per document to:
+
+```text
+input/<document_number>/Audit_Trail/<document_number>_audit_trail.csv
+```
+
+The audit trail covers all versions of the document.
+
 #### API security and connectivity
 
 - Use a local `.env` file for credentials and proxy settings; never commit it.
@@ -267,9 +297,9 @@ JSON responses from this endpoint are treated as Vault errors and recorded in `v
 - Use a Vault API access token or another approved production authentication method instead of embedding passwords in scheduled jobs.
 - Do not include session IDs, passwords, proxy credentials, or API tokens in logs, screenshots, manifests, or support tickets.
 
-### Manual audit trail and annotation export
+### Optional: manual Vault export
 
-Before running `zip_creator.py`, complete these Vault steps:
+The workflow downloads source files, annotations, and audit trails automatically. Use these UI steps only as a fallback (for example, for versions the API account cannot access) and place the results under the input folder before running `zip_creator.py`:
 
 1. Create or open the requested document report and enter each requested document name individually.
 2. Confirm the requested document numbers.
@@ -427,8 +457,10 @@ Common download failures recorded in the manifest:
 |---|---|
 | `INVALID_DATA: Content file does not exist` | The version has no source file in Vault. |
 | `INSUFFICIENT_ACCESS: Not authorized for permission [Download Source]` | The account lacks Download Source permission for that lifecycle/status (for example, Expired). |
+| `INVALID_DATA: Cannot find rendition [viewable_rendition__v]` | No viewable rendition exists, so annotations cannot be exported for that version. |
+| `INVALID_DOCUMENT` | The document ID is not visible to the account or no longer exists. |
 
-### 11.1 Prepare and download source versions
+### 11.1 Download source, annotations, and audit trails
 
 Set these values in `.env` before starting:
 
@@ -451,7 +483,7 @@ python -m pip install -r requirements.txt
 python run_veeva_workflow.py --clean
 ```
 
-The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, checkpoints `input/veeva_download_manifest.csv` every 25 rows, organizes the files, creates `output/<request-id>/<request-id>_delivery.zip`, and checks ZIP integrity. It writes source files directly into the ZIP rather than making another full copy under `output/`.
+The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, its annotation PDF into `input/<document-number>/Annotations/`, and the document's audit trail into `input/<document-number>/Audit_Trail/`. It checkpoints `input/veeva_download_manifest.csv` every 25 processed rows, organizes the files, creates `output/<request-id>/<request-id>_delivery.zip`, and checks ZIP integrity. It writes files directly into the ZIP rather than making another full copy under `output/`. Close the manifest in Excel before running; an open file blocks the checkpoint.
 
 `--clean` clears only the configured project input/output contents before running; it refuses to clean paths outside the project folder. If a run is interrupted, rerun without `--clean`: the wrapper skips nonempty files already downloaded and continues the version list. For a long list, process bounded batches and package on the final batch:
 
@@ -474,9 +506,9 @@ python veeva_download.py "narrow document name search"
 
 Do not use a broad search such as `Test` for a client delivery; it can match hundreds of versions.
 
-### 11.2 Add audit trails and annotations
+### 11.2 Review missing audit trails and annotations
 
-The downloader does not export audit trails or annotations. Complete the manual Vault export steps in section 7, extract the bulk export, and place the resulting files and annotation PDFs under the same input folder. Include document numbers and version identifiers in filenames as described in sections 8 and 10.
+Annotations and audit trails are downloaded automatically. Anything Vault could not return is listed in `exceptions_report.csv` and in the manifest's `annotation_status` / `audit_status` columns. Export those items manually if required (see "Optional: manual Vault export" in section 7) and place them under the input folder using the filename rules in sections 8 and 10, then rerun without `--clean`.
 
 ### 11.3 Organize files and create the ZIP
 
@@ -536,7 +568,7 @@ The uploader uses the SharePoint document library associated with the configured
 
 | Parameter | Example | Meaning |
 |---|---|---|
-| Input folder | `input` | API source downloads plus manually exported audit and annotation files. |
+| Input folder | `input` | API downloads (source, annotations, audit trails) plus any manually exported files. |
 | Request ID | `LIT-001` | Identifier for this litigation collection or delivery run. |
 | Output folder | `output` | Local root folder where the script creates results. |
 
@@ -562,12 +594,11 @@ Example structure:
 
 ```text
 output\LIT-001\
-├── veeva_download_manifest.csv (in the input folder before organization)
 ├── DOC123456\
 │   ├── Source\
 │   │   └── DOC123456_v1.0_source.pdf
 │   ├── Audit_Trail\
-│   │   └── DOC123456_v1.0_audit.csv
+│   │   └── DOC123456_audit_trail.csv
 │   └── Annotations\
 │       └── DOC123456_v1.0_Annotation.pdf
 ├── DOC234567\
@@ -577,7 +608,7 @@ output\LIT-001\
 │   └── file_without_document_number.pdf
 ├── collection_tracker.csv
 ├── exceptions_report.csv
-└── LIT-001_delivery.zip
+└── LIT-001_delivery.zip (also contains veeva_download_manifest.csv)
 ```
 
 ---
@@ -609,18 +640,21 @@ Columns:
 | Column | Meaning |
 |---|---|
 | `document_number` | Document number detected in the filename. |
-| `version` | Version detected in the filename or `UNKNOWN`. |
+| `version` | Version detected in the filename, `ALL` for a document-level audit trail, or `UNKNOWN`. |
 | `category` | `Source`, `Audit_Trail`, or `Annotations`. |
 | `source_file` | Original local file path. |
 | `output_file` | New organized local file path. |
 
 Open it in Excel to review the collection result.
 
-`veeva_download_manifest.csv` is created by `veeva_download.py` in the input folder. It records each downloaded document number, version, Vault document ID, and source-file path.
+`veeva_download_manifest.csv` is written to the input folder and included in the delivery ZIP. It has one row per version with `status` (`DOWNLOADED`, `FAILED`, or `NOT_ATTEMPTED`), `error`, `annotation_status`, and `audit_status`, plus the Vault document ID and local file paths.
 
 ### 13.3 `exceptions_report.csv`
 
-This file records files that could not be matched to a document number.
+This file lists everything that needs review:
+
+- Files that could not be matched to a document number (`Document number not found in filename`).
+- Source files, annotations, or audit trails that were not downloaded, with the Vault reason (for example, `Content file does not exist`).
 
 Example reason:
 
@@ -642,7 +676,7 @@ The final ZIP is created here:
 output\LIT-001\LIT-001_delivery.zip
 ```
 
-It contains document folders, the tracker, and the exceptions report. Review the output before manually uploading the ZIP or its contents to the required customer Teams/SharePoint location.
+It contains document folders, the tracker, the exceptions report, and the download manifest. Review the output before manually uploading the ZIP or its contents to the required customer Teams/SharePoint location.
 
 ---
 
@@ -779,18 +813,18 @@ Before manually uploading the final package to Teams/SharePoint, complete this c
 
 ## 18. Operator-performed steps
 
-The automation does not export audit trails or annotations and does not upload to SharePoint. Complete those tasks manually when required, then review the manifest, tracker, exceptions report, and ZIP before delivery.
+The automation does not create the Veeva report and does not upload to SharePoint unless `sharepoint_upload.py` is run. Items Vault cannot return (listed in `exceptions_report.csv`) must be exported manually when required. Review the manifest, tracker, exceptions report, and ZIP before delivery.
 
 ---
 
 ## 19. Summary
 
-The end-to-end automation retrieves the source versions listed by the client and prepares a local delivery package. Audit trails, annotations, and final transfer remain under operator control:
+The end-to-end automation retrieves the source versions, annotations, and audit trails listed by the client and prepares a local delivery package. Final transfer remains under operator control:
 
 ```text
-Read the client version list and download source versions
+Read the client version list
         ↓
-Optionally export audit trails and annotations manually
+Download source, annotations, and audit trails through the proxy
         ↓
 Organize input files and build a verified ZIP
         ↓

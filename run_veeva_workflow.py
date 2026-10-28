@@ -1,5 +1,4 @@
-# Databricks notebook source
-"""Download client-listed Veeva versions, organize them, and create a delivery ZIP."""
+"""Download client-listed Veeva versions, annotations, and audit trails, organize them, and create a delivery ZIP."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +18,7 @@ import zip_creator as organizer
 
 ROOT = Path(__file__).resolve().parent
 REQUIRED_COLUMNS = {"Document ID", "Document Number", "Major Version Number", "Minor Version Number"}
+DOWNLOAD_ERRORS = (requests.RequestException, RuntimeError, ValueError, OSError, KeyError)
 
 
 def project_path(value: str) -> Path:
@@ -82,11 +82,10 @@ def read_previous_manifest(path: Path) -> dict[str, dict[str, str]]:
 
 
 def write_manifest(rows: list[dict[str, str]], input_folder: Path) -> Path:
-    fields = ["document_number", "document_name", "filename__v", "version", "document_id", "status", "downloaded_file", "error"]
     manifest = input_folder / "veeva_download_manifest.csv"
     temporary = manifest.with_name(manifest.name + ".part")
     with temporary.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=downloader.MANIFEST_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(manifest)
@@ -101,6 +100,41 @@ def find_existing_download(input_folder: Path, document: dict[str, Any]) -> Path
     if not folder.is_dir():
         return None
     return next((path for path in folder.iterdir() if path.is_file() and path.name.casefold().startswith(prefix) and path.stat().st_size > 0), None)
+
+
+def nonempty(path: Path) -> bool:
+    return path.is_file() and path.stat().st_size > 0
+
+
+def is_storage_full(error: Exception) -> bool:
+    return isinstance(error, OSError) and error.errno == errno.ENOSPC
+
+
+def fetch_annotation_and_audit(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path, result: dict[str, str], audits: dict[str, tuple[str, str]]) -> None:
+    annotation = downloader.annotation_path(input_folder, document)
+    if nonempty(annotation):
+        result["annotation_status"], result["annotation_file"] = "DOWNLOADED", str(annotation)
+    else:
+        try:
+            result["annotation_file"] = str(downloader.download_annotations(api_root, api_version, session_id, document, input_folder))
+            result["annotation_status"] = "DOWNLOADED"
+        except DOWNLOAD_ERRORS as error:
+            if is_storage_full(error):
+                raise
+            result["annotation_status"] = f"FAILED: {error}"
+    document_id = str(document["id"])
+    if document_id not in audits:
+        audit = downloader.audit_trail_path(input_folder, document)
+        if nonempty(audit):
+            audits[document_id] = ("DOWNLOADED", str(audit))
+        else:
+            try:
+                audits[document_id] = ("DOWNLOADED", str(downloader.download_audit_trail(api_root, api_version, session_id, document, input_folder)))
+            except DOWNLOAD_ERRORS as error:
+                if is_storage_full(error):
+                    raise
+                audits[document_id] = (f"FAILED: {error}", "")
+    result["audit_status"], result["audit_file"] = audits[document_id]
 
 
 def run(clean: bool = False, start_index: int = 1, end_index: int | None = None, package: bool = True) -> int:
@@ -136,29 +170,39 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
     downloader.get_metadata(api_root, api_version, session_id)
 
     results = []
+    audits: dict[str, tuple[str, str]] = {}
     storage_full = False
     for index, document in enumerate(documents, start=1):
         number = str(document["document_number__v"])
         version = f"{document['major_version_number__v']}.{document['minor_version_number__v']}"
         key = f"{document['id']}|{version}"
-        result = {"document_number": number, "document_name": str(document.get("name__v") or ""), "filename__v": str(document.get("filename__v") or ""), "version": version, "document_id": str(document["id"]), "status": "NOT_ATTEMPTED", "downloaded_file": "", "error": ""}
+        in_range = start_index <= index <= end_index
+        result = {"document_number": number, "document_name": str(document.get("name__v") or ""), "filename__v": str(document.get("filename__v") or ""), "version": version, "document_id": str(document["id"]), "status": "NOT_ATTEMPTED", "downloaded_file": "", "error": "", "annotation_status": "NOT_ATTEMPTED", "annotation_file": "", "audit_status": "NOT_ATTEMPTED", "audit_file": ""}
+        if not in_range:
+            result.update({field: value for field, value in previous.get(key, {}).items() if field in result and value})
         existing = find_existing_download(input_folder, document)
         if existing:
-            result["status"] = "DOWNLOADED"
-            result["downloaded_file"] = str(existing)
-        elif index < start_index or index > end_index:
-            result.update(previous.get(key, result))
-        else:
+            result.update({"status": "DOWNLOADED", "downloaded_file": str(existing), "error": ""})
+        elif in_range:
             try:
                 destination = downloader.download_document_version(api_root, api_version, session_id, document, input_folder, verbose=False)
                 result["status"] = "DOWNLOADED"
                 result["downloaded_file"] = str(destination)
-            except (requests.RequestException, RuntimeError, ValueError, OSError, KeyError) as error:
+            except DOWNLOAD_ERRORS as error:
+                result["status"] = "FAILED"
                 result["error"] = str(error)
                 print(f"[{index}/{len(documents)}] FAILED {number} v{version}: {error}")
-                storage_full = isinstance(error, OSError) and error.errno == errno.ENOSPC
+                storage_full = is_storage_full(error)
+        if in_range and not storage_full:
+            try:
+                fetch_annotation_and_audit(api_root, api_version, session_id, document, input_folder, result, audits)
+            except OSError as error:
+                print(f"[{index}/{len(documents)}] FAILED annotation/audit {number} v{version}: {error}")
+                storage_full = True
+            if result["annotation_status"].startswith("FAILED") or result["audit_status"].startswith("FAILED"):
+                print(f"[{index}/{len(documents)}] {number} v{version}: annotation={result['annotation_status']}; audit={result['audit_status']}")
         results.append(result)
-        if index % 25 == 0 or index == end_index or storage_full:
+        if (in_range and index % 25 == 0) or index == end_index or storage_full:
             manifest = write_manifest(results, input_folder)
             completed = sum(row["status"] == "DOWNLOADED" for row in results)
             print(f"Checkpoint {index}/{len(documents)}: {completed} downloaded; manifest: {manifest}")
@@ -168,7 +212,11 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
 
     manifest = write_manifest(results, input_folder)
     downloaded = sum(row["status"] == "DOWNLOADED" for row in results)
+    annotations = sum(row["annotation_status"] == "DOWNLOADED" for row in results)
+    audit_docs = {row["document_id"] for row in results}
+    audit_count = len({row["document_id"] for row in results if row["audit_status"] == "DOWNLOADED"})
     print(f"Downloads: {downloaded}/{len(documents)}; manifest: {manifest}")
+    print(f"Annotations: {annotations}/{len(documents)} versions; audit trails: {audit_count}/{len(audit_docs)} documents")
     if not package:
         return 0 if not storage_full else 1
     if downloaded == 0:
