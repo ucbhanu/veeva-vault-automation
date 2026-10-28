@@ -37,19 +37,15 @@ def category_for(filename: str) -> str:
 
 def manifest_exceptions(manifest: Path) -> list[dict[str, str]]:
     exceptions: list[dict[str, str]] = []
-    audited: set[str] = set()
     with manifest.open(newline="", encoding="utf-8-sig") as handle:
         for row in csv.DictReader(handle):
             label = f"{row['document_number']} v{row['version']}"
             if row.get("status") != "DOWNLOADED":
                 exceptions.append({"file": f"{label} Source", "reason": row.get("error") or row.get("status") or "Not downloaded"})
-            annotation = row.get("annotation_status") or ""
-            if annotation and annotation != "DOWNLOADED":
-                exceptions.append({"file": f"{label} Annotation", "reason": annotation})
-            audit = row.get("audit_status") or ""
-            if audit and audit != "DOWNLOADED" and row["document_number"] not in audited:
-                audited.add(row["document_number"])
-                exceptions.append({"file": f"{row['document_number']} Audit Trail", "reason": audit})
+            for kind, column in (("Annotation", "annotation_status"), ("Audit Trail", "audit_status")):
+                status = row.get(column) or ""
+                if status and status != "DOWNLOADED":
+                    exceptions.append({"file": f"{label} {kind}", "reason": status})
     return exceptions
 
 
@@ -82,7 +78,7 @@ def process(input_folder: Path, request_id: str, output_root: Path, copy_files: 
         version_match = VERSION_PATTERN.search(source.name)
         version = version_match.group(1).replace("_", ".") if version_match else ("ALL" if category == "Audit_Trail" else "UNKNOWN")
         target_name = f"{document_number}_v{version}_Annotation{source.suffix}" if category == "Annotations" else source.name
-        relative_target = Path(document_number) / category / target_name
+        relative_target = Path(document_number) / target_name
         target = delivery_root / relative_target
         if copy_files:
             target.parent.mkdir(parents=True, exist_ok=True)

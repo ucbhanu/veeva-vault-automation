@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import io
 import mimetypes
 import os
 import re
@@ -13,9 +12,12 @@ from typing import Any
 from urllib.parse import urlparse
 
 import requests
+from fpdf import FPDF
 from requests.adapters import HTTPAdapter
 
 FILENAME_PATTERN = re.compile(r'filename="?([^";]+)"?')
+FONT_FOLDER = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+AUDIT_COLUMNS = [("timestamp", "Timestamp (UTC)", 34), ("full_name", "User", 36), ("action", "Action", 32), ("event_description", "Description", 55), ("field_name", "Field", 30), ("old_value", "Old value", 45), ("new_value", "New value", 45)]
 MANIFEST_FIELDS = ["document_number", "document_name", "filename__v", "version", "document_id", "status", "downloaded_file", "error", "annotation_status", "annotation_file", "audit_status", "audit_file"]
 
 
@@ -184,7 +186,8 @@ def annotation_path(input_folder: Path, document: dict[str, Any]) -> Path:
 
 def audit_trail_path(input_folder: Path, document: dict[str, Any]) -> Path:
     number = str(document.get("document_number__v", document["id"]))
-    return input_folder / number / "Audit_Trail" / f"{number}_audit_trail.csv"
+    version = f"{document['major_version_number__v']}.{document['minor_version_number__v']}"
+    return input_folder / number / "Audit_Trail" / f"{number}_v{version}_audit_trail.pdf"
 
 
 def download_annotations(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path) -> Path:
@@ -201,20 +204,55 @@ def download_annotations(api_root: str, api_version: str, session_id: str, docum
     return destination
 
 
-def download_audit_trail(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path) -> Path:
-    headers = {"Authorization": session_id, "Accept": "application/json"}
-    url = f"{api_root}/{api_version}/objects/documents/{document['id']}/audittrail"
-    first = api_request(HTTP.get(url, params={"limit": 1000}, headers=headers, timeout=120), "Audit trail request")
-    entries = fetch_all_pages(first, api_root, headers, "Audit trail page")
-    fields: list[str] = []
-    for entry in entries:
-        fields.extend(key for key in entry if key not in fields)
-    buffer = io.StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=fields or ["timestamp", "user_name", "action"])
-    writer.writeheader()
-    writer.writerows(entries)
+def fetch_audit_entries(api_root: str, api_version: str, session_id: str, document_id: str, cache: dict[str, Any]) -> list[dict[str, Any]]:
+    if document_id not in cache:
+        headers = {"Authorization": session_id, "Accept": "application/json"}
+        url = f"{api_root}/{api_version}/objects/documents/{document_id}/audittrail"
+        try:
+            first = api_request(HTTP.get(url, params={"limit": 1000}, headers=headers, timeout=120), "Audit trail request")
+            cache[document_id] = fetch_all_pages(first, api_root, headers, "Audit trail page")
+        except (requests.RequestException, RuntimeError, ValueError) as error:
+            cache[document_id] = error
+    if isinstance(cache[document_id], Exception):
+        raise RuntimeError(str(cache[document_id]))
+    return cache[document_id]
+
+
+def audit_trail_pdf(entries: list[dict[str, Any]], number: str, version: str, document_id: str) -> bytes:
+    pdf = FPDF(orientation="L", format="A4")
+    family = "Helvetica"
+    if (FONT_FOLDER / "arial.ttf").is_file() and (FONT_FOLDER / "arialbd.ttf").is_file():
+        pdf.add_font("Arial", "", str(FONT_FOLDER / "arial.ttf"))
+        pdf.add_font("Arial", "B", str(FONT_FOLDER / "arialbd.ttf"))
+        family = "Arial"
+    pdf.set_auto_page_break(auto=True, margin=10)
+    pdf.add_page()
+    pdf.set_font(family, "B", 13)
+    pdf.cell(text=f"Audit Trail - {number} v{version}", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font(family, "", 9)
+    pdf.cell(text=f"Vault document ID {document_id}; {len(entries)} event(s)", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    pdf.set_font(family, "", 7)
+    with pdf.table(col_widths=[width for _, _, width in AUDIT_COLUMNS], text_align="LEFT", repeat_headings=1) as table:
+        heading = table.row()
+        for _, label, _ in AUDIT_COLUMNS:
+            heading.cell(label)
+        for entry in entries:
+            row = table.row()
+            for key, _, _ in AUDIT_COLUMNS:
+                value = entry.get(key) or (entry.get("user_name") if key == "full_name" else "")
+                row.cell(str(value or ""))
+    return bytes(pdf.output())
+
+
+def download_audit_trail(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path, cache: dict[str, Any]) -> Path:
+    """Write the version's audit events as PDF; the document history is fetched once per document via cache."""
+    document_id = str(document["id"])
+    version = f"{document['major_version_number__v']}.{document['minor_version_number__v']}"
+    entries = [entry for entry in fetch_audit_entries(api_root, api_version, session_id, document_id, cache) if str(entry.get("version", "")) == version]
+    entries.sort(key=lambda entry: str(entry.get("timestamp", "")))
     destination = audit_trail_path(input_folder, document)
-    write_file(destination, buffer.getvalue().encode("utf-8-sig"))
+    write_file(destination, audit_trail_pdf(entries, str(document.get("document_number__v", document_id)), version, document_id))
     return destination
 
 
@@ -247,7 +285,7 @@ def main() -> None:
         return
     errors = (requests.RequestException, RuntimeError, ValueError, OSError)
     rows: list[dict[str, str]] = []
-    audits: dict[str, tuple[str, str]] = {}
+    audit_cache: dict[str, Any] = {}
     downloaded = 0
     for document in documents:
         filename_v = str(document.get("filename__v") or "")
@@ -268,18 +306,17 @@ def main() -> None:
             row["annotation_status"] = "DOWNLOADED"
         except errors as error:
             row["annotation_status"] = f"FAILED: {error}"
-        if row["document_id"] not in audits:
-            try:
-                audits[row["document_id"]] = ("DOWNLOADED", str(download_audit_trail(api_root, api_version, session_id, document, input_folder)))
-            except errors as error:
-                audits[row["document_id"]] = (f"FAILED: {error}", "")
-        row["audit_status"], row["audit_file"] = audits[row["document_id"]]
+        try:
+            row["audit_file"] = str(download_audit_trail(api_root, api_version, session_id, document, input_folder, audit_cache))
+            row["audit_status"] = "DOWNLOADED"
+        except errors as error:
+            row["audit_status"] = f"FAILED: {error}"
         rows.append(row)
     write_download_manifest(rows, input_folder)
     annotations = sum(row["annotation_status"] == "DOWNLOADED" for row in rows)
-    audit_count = sum(status == "DOWNLOADED" for status, _ in audits.values())
+    audit_count = sum(row["audit_status"] == "DOWNLOADED" for row in rows)
     print(f"Finished: {downloaded} downloaded, {len(rows) - downloaded} failed/unavailable out of {len(rows)} versions.")
-    print(f"Annotations: {annotations}/{len(rows)} versions; audit trails: {audit_count}/{len(audits)} documents.")
+    print(f"Annotations: {annotations}/{len(rows)} versions; audit trails: {audit_count}/{len(rows)} versions.")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads each version's source file and annotation PDF plus each document's audit trail, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
+This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads each version's source file, annotation PDF, and audit trail PDF, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
 
 ```text
 Client version-list workbook
@@ -41,13 +41,13 @@ The wrapper performs steps 2–6 through the Vault API from the version list, th
 - Authenticate to the configured Vault through the configured proxy.
 - Read exact document IDs and major/minor versions from the configured client workbook and download source files into document-number folders.
 - Export each listed version's annotations as `<Document Number>_v<Version>_Annotation.pdf`.
-- Export each listed document's complete audit trail as `<Document Number>_audit_trail.csv`.
+- Export each listed version's audit trail as `<Document Number>_v<Version>_audit_trail.pdf` (the document history is fetched once and filtered to that version's events).
 - Write a manifest of source, annotation, and audit-trail results per version.
 - Resume interrupted downloads by reusing completed nonempty files and checkpointing the manifest.
 - Read additional manually exported files from the input folder, including subfolders.
 - Detect document numbers such as `DOC123456` and hyphenated Vault document numbers.
 - Classify files as **Source**, **Audit_Trail**, or **Annotations**.
-- Create one folder per document number.
+- Create one folder per document number containing that document's source, annotation, and audit trail files.
 - Rename annotation files.
 - Create a collection tracker CSV.
 - Create an exceptions report CSV for files without a document number and for every source file, annotation, or audit trail that could not be downloaded.
@@ -91,7 +91,7 @@ Python 3.10.x
 
 ### Python dependencies
 
-The API downloader requires `requests`. The workbook-driven workflow also requires `openpyxl`. Install both with `python -m pip install -r requirements.txt`.
+The API downloader requires `requests`; audit trail PDFs are generated with `fpdf2` (using the Windows Arial font when available). The workbook-driven workflow also requires `openpyxl`. Install all with `python -m pip install -r requirements.txt`.
 
 ---
 
@@ -281,13 +281,11 @@ Authorization: <sessionId>
 Accept: application/json
 ```
 
-All pages are followed through `responseDetails.next_page` and written once per document to:
+All pages are followed through `responseDetails.next_page`. The history is fetched once per document, filtered by each event's `version`, sorted by timestamp, and written per version as a PDF (timestamp, user, action, description, field, old and new value):
 
 ```text
-input/<document_number>/Audit_Trail/<document_number>_audit_trail.csv
+input/<document_number>/Audit_Trail/<document_number>_v<major>.<minor>_audit_trail.pdf
 ```
-
-The audit trail covers all versions of the document.
 
 #### API security and connectivity
 
@@ -483,7 +481,7 @@ python -m pip install -r requirements.txt
 python run_veeva_workflow.py --clean
 ```
 
-The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, its annotation PDF into `input/<document-number>/Annotations/`, and the document's audit trail into `input/<document-number>/Audit_Trail/`. It checkpoints `input/veeva_download_manifest.csv` every 25 processed rows, organizes the files, creates `output/<request-id>/<request-id>_delivery.zip`, and checks ZIP integrity. It writes files directly into the ZIP rather than making another full copy under `output/`. Close the manifest in Excel before running; an open file blocks the checkpoint.
+The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, its annotation PDF into `input/<document-number>/Annotations/`, and the version's audit trail PDF into `input/<document-number>/Audit_Trail/`. It checkpoints `input/veeva_download_manifest.csv` every 25 processed rows, organizes the files, creates `output/<request-id>/<request-id>_delivery.zip`, and checks ZIP integrity. It writes files directly into the ZIP rather than making another full copy under `output/`. Close the manifest in Excel before running; an open file blocks the checkpoint.
 
 `--clean` clears only the configured project input/output contents before running; it refuses to clean paths outside the project folder. If a run is interrupted, rerun without `--clean`: the wrapper skips nonempty files already downloaded and continues the version list. For a long list, process bounded batches and package on the final batch:
 
@@ -594,16 +592,17 @@ Example structure:
 
 ```text
 output\LIT-001\
-├── DOC123456\
-│   ├── Source\
-│   │   └── DOC123456_v1.0_source.pdf
-│   ├── Audit_Trail\
-│   │   └── DOC123456_audit_trail.csv
-│   └── Annotations\
-│       └── DOC123456_v1.0_Annotation.pdf
-├── DOC234567\
-│   └── Source\
-│       └── DOC234567_v2.1_source.msg
+├── AN-KYL-US-0234\
+│   ├── AN-KYL-US-0234_v0.1_Annotation.pdf
+│   ├── AN-KYL-US-0234_v0.1_audit_trail.pdf
+│   └── AN-KYL-US-0234_v0.1_Use Before Approval Form.pdf
+├── CA-CON-AL-0001\
+│   ├── CA-CON-AL-0001_v1.0_Annotation.pdf
+│   ├── CA-CON-AL-0001_v1.0_audit_trail.pdf
+│   ├── CA-CON-AL-0001_v1.0_Untitled.png
+│   ├── CA-CON-AL-0001_v1.1_Annotation.pdf
+│   ├── CA-CON-AL-0001_v1.1_audit_trail.pdf
+│   └── CA-CON-AL-0001_v1.1_Untitled.png
 ├── Unmatched\
 │   └── file_without_document_number.pdf
 ├── collection_tracker.csv
@@ -611,25 +610,21 @@ output\LIT-001\
 └── LIT-001_delivery.zip (also contains veeva_download_manifest.csv)
 ```
 
+Each document folder holds three files per version: `<Document Number>_v<Version>_Annotation.pdf`, `<Document Number>_v<Version>_audit_trail.pdf`, and `<Document Number>_v<Version>_<original source filename>`.
+
 ---
 
 ## 13. Output files explained
 
 ### 13.1 Document folders
 
-Each identified document number gets one folder:
+Each identified document number gets one folder in the ZIP, and all of that document's files sit directly inside it (no subfolders):
 
 ```text
 DOC123456\
 ```
 
-The script creates the applicable subfolders as it finds files:
-
-```text
-Source\
-Audit_Trail\
-Annotations\
-```
+The category (`Source`, `Audit_Trail`, `Annotations`) is still recorded in `collection_tracker.csv`. Locally, the input folder keeps `Source\`, `Audit_Trail\`, and `Annotations\` subfolders so the organizer can classify each file.
 
 ### 13.2 `collection_tracker.csv`
 
@@ -640,7 +635,7 @@ Columns:
 | Column | Meaning |
 |---|---|
 | `document_number` | Document number detected in the filename. |
-| `version` | Version detected in the filename, `ALL` for a document-level audit trail, or `UNKNOWN`. |
+| `version` | Version detected in the filename, `ALL` for a manually supplied audit trail without a version, or `UNKNOWN`. |
 | `category` | `Source`, `Audit_Trail`, or `Annotations`. |
 | `source_file` | Original local file path. |
 | `output_file` | New organized local file path. |
@@ -704,10 +699,10 @@ python zip_creator.py `
 ### Result
 
 ```text
-output\LIT-DEMO\DOC123456\Source\DOC123456_v1.0_source.pdf
-output\LIT-DEMO\DOC123456\Audit_Trail\DOC123456_v1.0_audit.csv
-output\LIT-DEMO\DOC123456\Annotations\DOC123456_v1.0_Annotation.pdf
-output\LIT-DEMO\DOC234567\Source\DOC234567_v2.1_source.pdf
+output\LIT-DEMO\DOC123456\DOC123456_v1.0_source.pdf
+output\LIT-DEMO\DOC123456\DOC123456_v1.0_audit.csv
+output\LIT-DEMO\DOC123456\DOC123456_v1.0_Annotation.pdf
+output\LIT-DEMO\DOC234567\DOC234567_v2.1_source.pdf
 output\LIT-DEMO\Unmatched\notes.txt
 output\LIT-DEMO\collection_tracker.csv
 output\LIT-DEMO\exceptions_report.csv

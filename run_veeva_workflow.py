@@ -110,7 +110,7 @@ def is_storage_full(error: Exception) -> bool:
     return isinstance(error, OSError) and error.errno == errno.ENOSPC
 
 
-def fetch_annotation_and_audit(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path, result: dict[str, str], audits: dict[str, tuple[str, str]]) -> None:
+def fetch_annotation_and_audit(api_root: str, api_version: str, session_id: str, document: dict[str, Any], input_folder: Path, result: dict[str, str], audit_cache: dict[str, Any]) -> None:
     annotation = downloader.annotation_path(input_folder, document)
     if nonempty(annotation):
         result["annotation_status"], result["annotation_file"] = "DOWNLOADED", str(annotation)
@@ -122,19 +122,17 @@ def fetch_annotation_and_audit(api_root: str, api_version: str, session_id: str,
             if is_storage_full(error):
                 raise
             result["annotation_status"] = f"FAILED: {error}"
-    document_id = str(document["id"])
-    if document_id not in audits:
-        audit = downloader.audit_trail_path(input_folder, document)
-        if nonempty(audit):
-            audits[document_id] = ("DOWNLOADED", str(audit))
-        else:
-            try:
-                audits[document_id] = ("DOWNLOADED", str(downloader.download_audit_trail(api_root, api_version, session_id, document, input_folder)))
-            except DOWNLOAD_ERRORS as error:
-                if is_storage_full(error):
-                    raise
-                audits[document_id] = (f"FAILED: {error}", "")
-    result["audit_status"], result["audit_file"] = audits[document_id]
+    audit = downloader.audit_trail_path(input_folder, document)
+    if nonempty(audit):
+        result["audit_status"], result["audit_file"] = "DOWNLOADED", str(audit)
+    else:
+        try:
+            result["audit_file"] = str(downloader.download_audit_trail(api_root, api_version, session_id, document, input_folder, audit_cache))
+            result["audit_status"] = "DOWNLOADED"
+        except DOWNLOAD_ERRORS as error:
+            if is_storage_full(error):
+                raise
+            result["audit_status"] = f"FAILED: {error}"
 
 
 def run(clean: bool = False, start_index: int = 1, end_index: int | None = None, package: bool = True) -> int:
@@ -170,7 +168,7 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
     downloader.get_metadata(api_root, api_version, session_id)
 
     results = []
-    audits: dict[str, tuple[str, str]] = {}
+    audit_cache: dict[str, Any] = {}
     storage_full = False
     for index, document in enumerate(documents, start=1):
         number = str(document["document_number__v"])
@@ -195,7 +193,7 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
                 storage_full = is_storage_full(error)
         if in_range and not storage_full:
             try:
-                fetch_annotation_and_audit(api_root, api_version, session_id, document, input_folder, result, audits)
+                fetch_annotation_and_audit(api_root, api_version, session_id, document, input_folder, result, audit_cache)
             except OSError as error:
                 print(f"[{index}/{len(documents)}] FAILED annotation/audit {number} v{version}: {error}")
                 storage_full = True
@@ -213,10 +211,9 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
     manifest = write_manifest(results, input_folder)
     downloaded = sum(row["status"] == "DOWNLOADED" for row in results)
     annotations = sum(row["annotation_status"] == "DOWNLOADED" for row in results)
-    audit_docs = {row["document_id"] for row in results}
-    audit_count = len({row["document_id"] for row in results if row["audit_status"] == "DOWNLOADED"})
+    audit_count = sum(row["audit_status"] == "DOWNLOADED" for row in results)
     print(f"Downloads: {downloaded}/{len(documents)}; manifest: {manifest}")
-    print(f"Annotations: {annotations}/{len(documents)} versions; audit trails: {audit_count}/{len(audit_docs)} documents")
+    print(f"Annotations: {annotations}/{len(documents)} versions; audit trails: {audit_count}/{len(documents)} versions")
     if not package:
         return 0 if not storage_full else 1
     if downloaded == 0:
