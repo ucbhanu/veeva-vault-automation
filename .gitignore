@@ -4,5 +4,6 @@ reference/
 .venv/
 __pycache__/
 .env
+.msal_token_cache.json
 *.pptx
 *.docx

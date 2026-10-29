@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads each version's source file, annotation PDF, and audit trail PDF, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery ZIP.
+This project automates retrieval and packaging of client-listed Veeva document versions. The workflow authenticates through the configured proxy, reads exact document IDs and major/minor versions from the workbook in `reference/`, downloads each version's source file, annotation PDF, and audit trail PDF, organizes them by document number, writes a manifest and exceptions report, and creates a verified delivery folder (no ZIP).
 
 ```text
 Client version-list workbook
@@ -11,10 +11,10 @@ Authenticate and download source, annotations, and audit trails
         ↓
 Organize files by document number
         ↓
-Manifest, tracker, exceptions report, and delivery ZIP
+Manifest, tracker, exceptions report, and delivery folder
 ```
 
-The automation reads Vault content only; it does not modify Vault records. SharePoint upload remains a separate operator-performed step.
+The automation reads Vault content only; it does not modify Vault records. After the delivery folder passes its copy check, the workflow uploads it to SharePoint using `SHAREPOINT_UPLOAD_METHOD` from `.env` (`graph`, `sync`, or `none`).
 
 ---
 
@@ -51,7 +51,8 @@ The wrapper performs steps 2–6 through the Vault API from the version list, th
 - Rename annotation files.
 - Create a collection tracker CSV.
 - Create an exceptions report CSV for files without a document number and for every source file, annotation, or audit trail that could not be downloaded.
-- Create one ZIP package for the processed request, including the download manifest.
+- Create one delivery folder for the processed request, including the download manifest. No ZIP is created.
+- Upload that delivery folder (`output\<request-id>`) to the configured SharePoint folder.
 
 ### Not included
 
@@ -59,7 +60,7 @@ The wrapper performs steps 2–6 through the Vault API from the version list, th
 - PDF page splitting, OCR, or interpretation of document content.
 - Validation that a downloaded annotation PDF actually contains annotations (Vault returns the viewable rendition with any annotations applied).
 - Checksum manifest generation.
-- Automatic Microsoft Teams / SharePoint upload.
+- Uploading to a Teams chat (files go to the channel's SharePoint folder).
 - Processing files that do not contain an identifiable document number unless manually renamed before execution.
 
 ---
@@ -91,7 +92,7 @@ Python 3.10.x
 
 ### Python dependencies
 
-The API downloader requires `requests`; audit trail PDFs are generated with `fpdf2` (using the Windows Arial font when available). The workbook-driven workflow also requires `openpyxl`. Install all with `python -m pip install -r requirements.txt`.
+The API downloader requires `requests`; audit trail PDFs are generated with `fpdf2` (using the Windows Arial font when available). The workbook-driven workflow also requires `openpyxl`. The SharePoint Graph upload requires `msal[broker]` (Microsoft sign-in through the Windows account broker). Install all with `python -m pip install -r requirements.txt` (through the proxy, see section 11.0).
 
 ---
 
@@ -104,8 +105,10 @@ veeva-vault-automation\
 ├── run_veeva_workflow.py
 ├── zip_creator.py
 ├── veeva_download.py
+├── sharepoint_upload.py
 ├── requirements.txt
-├── .env
+├── .env.example
+├── .env (local; not committed)
 ├── reference\ (local client files; not committed)
 ├── README.md
 ├── sample_files_note.txt
@@ -114,16 +117,17 @@ veeva-vault-automation\
 
 | File | Purpose |
 |---|---|
-| `zip_creator.py` | Main script that organizes files and creates the delivery ZIP. |
+| `zip_creator.py` | Organizes files into the delivery folder (the name is historical; it no longer creates a ZIP). |
 | `veeva_download.py` | Authenticates, downloads source versions, annotation PDFs, and audit trails. |
-| `run_veeva_workflow.py` | Runs workbook-driven download, organization, ZIP creation, and integrity validation. |
+| `run_veeva_workflow.py` | Runs workbook-driven download, organization into the delivery folder, copy verification, and the SharePoint upload. |
 | `reference/` | Client-supplied workbook listing the exact documents and versions to download. |
-| `requirements.txt` | Python dependencies for the downloader and workbook workflow. |
-| `.env` | Local credentials, Vault/proxy settings, search text, and paths. It is Git-ignored. |
-| `sharepoint_upload.py` | Separate Microsoft Graph uploader for an approved delivery ZIP. |
+| `requirements.txt` | Python dependencies for the downloader, workbook workflow, and SharePoint upload. |
+| `.env.example` | Template for `.env` with every setting and placeholder values. |
+| `.env` | Local credentials, Vault/proxy/SharePoint settings, and paths. It is Git-ignored. |
+| `sharepoint_upload.py` | Uploads the delivery folder to SharePoint (Microsoft Graph or OneDrive-synced folder); called by the workflow and usable on its own. |
 | `README.md` | This operating guide. |
 | `sample_files_note.txt` | Short filename examples. |
-| `.gitignore` | Prevents generated `output` content from being added to Git. |
+| `.gitignore` | Keeps `.env`, the sign-in token cache, `input`, `output`, and `reference` out of Git. |
 
 ---
 
@@ -163,30 +167,53 @@ The client version-list workbook is kept under `reference/`. `VEEVA_VERSION_LIST
 
 ### Configure the end-to-end workflow
 
-Create a local `.env` file. Keep credentials and proxy secrets out of source control:
+Copy `.env.example` to `.env` and fill in the values. Keep credentials and proxy secrets out of source control:
 
 ```text
-VEEVA_INPUT_FOLDER=input
-VEEVA_REQUEST_ID=LIT-001
-VEEVA_OUTPUT_FOLDER=output
-VEEVA_VERSION_LIST=reference/<client-version-list.xlsx>
+# Veeva Vault credentials
 VEEVA_USERNAME=<Veeva username>
 VEEVA_PASSWORD=<Veeva password>
-AUTH_URL=https://<vault-host>/api/v26.2/auth
+
+# Reference details (use a new VEEVA_REQUEST_ID per run)
+VEEVA_INPUT_FOLDER=input
+VEEVA_REQUEST_ID=CLIENT-LIST-YYYY-MM-DD
+VEEVA_OUTPUT_FOLDER=output
+VEEVA_VERSION_LIST=reference/<client-version-list.xlsx>
+
+# Veeva Vault authentication details
+AUTH_URL=https://bayer-content-factory.veevavault.com/api/v26.2/auth
+#AUTH_URL=https://sbbayer-uat.veevavault.com/api/v26.2/auth
 VEEVA_API_VERSION=v26.2
+
+# Proxy details
 VEEVA_PROXY=http://<username>:<password>@<proxy-host>:<port>
+
+# SharePoint details
+SHAREPOINT_UPLOAD_METHOD=graph          # graph, sync, or none
+SHAREPOINT_SYNC_FOLDER=<OneDrive shortcut path>   # sync only
+SHAREPOINT_SHARE_URL=<"Copy link" URL of the target SharePoint folder>
+SHAREPOINT_AUTH=user
+SHAREPOINT_LOGIN=broker
+SHAREPOINT_LOGIN_HINT=<your company e-mail>
+SHAREPOINT_USE_PROXY=true
 ```
 
-Use `STAGE_AUTH_URL` instead of `AUTH_URL` when the approved Vault setup requires a separate Stage or discovery authentication URL. Do not set both unless the intended override is clear; `STAGE_AUTH_URL` takes precedence.
+`AUTH_URL` selects the Vault: production (`bayer-content-factory`) or UAT (`sbbayer-uat`). Keep the other one commented out. UAT needs an account with UAT access.
+
+If the user has no access to the `AUTH_URL` Vault, Vault silently signs in to the user's default Vault instead. The downloader stops in that case and lists the Vaults available to the user. To use a listed Vault deliberately (for example when signing in through a discovery host), set `VEEVA_VAULT_ID=<id>`.
 
 Install dependencies and run the full workflow:
 
 ```powershell
 python -m pip install -r requirements.txt
-python run_veeva_workflow.py --clean
+python run_veeva_workflow.py --clean                     # download, build delivery, upload per SHAREPOINT_UPLOAD_METHOD
+python run_veeva_workflow.py --clean --upload none       # one-off override: graph, sync, or none
+python run_veeva_workflow.py --clean --upload-no-proxy   # one-off override of SHAREPOINT_USE_PROXY for Graph
 ```
 
-The wrapper authenticates, validates metadata, downloads each workbook-listed version's source and annotation PDF and each document's audit trail, checkpoints `veeva_download_manifest.csv`, organizes the files, and creates a delivery ZIP. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
+The workflow uploads only the folder it generated (`output\<request-id>`), and only after it passes its copy check. Use a new `VEEVA_REQUEST_ID` for each run; an existing folder with the same name in SharePoint is never overwritten. See [Upload to Teams-connected SharePoint](#upload-to-teams-connected-sharepoint) for the settings.
+
+The wrapper authenticates, validates metadata, downloads each workbook-listed version's source and annotation PDF and each document's audit trail, checkpoints `veeva_download_manifest.csv`, organizes the files, and creates the delivery folder. It uses Windows' trusted root and CA certificates for TLS verification; do not disable certificate verification.
 
 The name-search mode remains available through `veeva_download.py`, but the client-list workflow uses exact document IDs and versions from `VEEVA_VERSION_LIST`.
 
@@ -443,11 +470,11 @@ Run these steps in **PowerShell** from the project folder. The downloader reads 
    python run_veeva_workflow.py --clean --start-index 1 --end-index 10
    ```
 
-   Expected: `Authenticated`, `Metadata OK`, per-row `FAILED` lines only for Vault content/permission errors, and `ZIP integrity: OK`. The exit code is `1` whenever fewer than all workbook rows are downloaded, so a partial batch returns `1` even when it worked.
+   Expected: `Authenticated`, `Metadata OK`, per-row `FAILED` lines only for Vault content/permission errors, `Delivery check: OK`, and a `SharePoint (graph): <url>` line. The first Graph upload opens a Microsoft sign-in window; later runs reuse the cached sign-in. The exit code is `1` whenever fewer than all workbook rows are downloaded, so a partial batch returns `1` even when it worked.
 
 5. Run the full list (in one go or in batches, see 11.1), then review `input/veeva_download_manifest.csv`, `output/<request-id>/collection_tracker.csv`, and `output/<request-id>/exceptions_report.csv`.
 
-6. Deliver `output/<request-id>/<request-id>_delivery.zip` after review (optionally with `sharepoint_upload.py`).
+6. Check the uploaded `<request-id>` folder in SharePoint (the workflow uploads it automatically per `SHAREPOINT_UPLOAD_METHOD`).
 
 Common download failures recorded in the manifest:
 
@@ -460,19 +487,7 @@ Common download failures recorded in the manifest:
 
 ### 11.1 Download source, annotations, and audit trails
 
-Set these values in `.env` before starting:
-
-```text
-VEEVA_INPUT_FOLDER=input
-VEEVA_REQUEST_ID=LIT-001
-VEEVA_OUTPUT_FOLDER=output
-VEEVA_VERSION_LIST=reference/US Litigation Activity_test document list_all_versions_repaired.xlsx
-VEEVA_USERNAME=<Veeva username>
-VEEVA_PASSWORD=<Veeva password>
-VEEVA_DOCUMENT_NAME_CONTAINS=<narrow document name search text>
-AUTH_URL=https://<vault-host>/api/v26.2/auth
-VEEVA_API_VERSION=v26.2
-```
+Set the values from section 7 in `.env` before starting (`VEEVA_DOCUMENT_NAME_CONTAINS` is only needed for the standalone name-search mode).
 
 Install dependencies once. For a client-supplied version list, run the end-to-end wrapper from PowerShell:
 
@@ -481,7 +496,7 @@ python -m pip install -r requirements.txt
 python run_veeva_workflow.py --clean
 ```
 
-The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, its annotation PDF into `input/<document-number>/Annotations/`, and the version's audit trail PDF into `input/<document-number>/Audit_Trail/`. It checkpoints `input/veeva_download_manifest.csv` every 25 processed rows, organizes the files, creates `output/<request-id>/<request-id>_delivery.zip`, and checks ZIP integrity. It writes files directly into the ZIP rather than making another full copy under `output/`. Close the manifest in Excel before running; an open file blocks the checkpoint.
+The wrapper authenticates through `VEEVA_PROXY`, reads each version from `VEEVA_VERSION_LIST`, downloads its source into `input/<document-number>/Source/`, its annotation PDF into `input/<document-number>/Annotations/`, and the version's audit trail PDF into `input/<document-number>/Audit_Trail/`. It checkpoints `input/veeva_download_manifest.csv` every 25 processed rows, organizes the files into `output/<request-id>/<document-number>/`, verifies that every copied file exists with the same size as its source, and then uploads `output/<request-id>/` to SharePoint per `SHAREPOINT_UPLOAD_METHOD`. With `--no-package`, nothing is organized or uploaded. No ZIP is created. Close the manifest in Excel before running; an open file blocks the checkpoint.
 
 `--clean` clears only the configured project input/output contents before running; it refuses to clean paths outside the project folder. If a run is interrupted, rerun without `--clean`: the wrapper skips nonempty files already downloaded and continues the version list. For a long list, process bounded batches and package on the final batch:
 
@@ -508,7 +523,7 @@ Do not use a broad search such as `Test` for a client delivery; it can match hun
 
 Annotations and audit trails are downloaded automatically. Anything Vault could not return is listed in `exceptions_report.csv` and in the manifest's `annotation_status` / `audit_status` columns. Export those items manually if required (see "Optional: manual Vault export" in section 7) and place them under the input folder using the filename rules in sections 8 and 10, then rerun without `--clean`.
 
-### 11.3 Organize files and create the ZIP
+### 11.3 Organize files into the delivery folder
 
 Set a unique `VEEVA_REQUEST_ID` in `.env` for this delivery, then run:
 
@@ -525,42 +540,65 @@ python zip_creator.py `
         "output"
 ```
 
-The organizer copies files into `output\\<request-id>`, writes `collection_tracker.csv` and `exceptions_report.csv`, and creates `<request-id>_delivery.zip`. It does not delete or modify the source files. Use a new request ID for each run so an earlier delivery is not mixed with a rerun.
+The organizer copies files into `output\\<request-id>`, writes `collection_tracker.csv` and `exceptions_report.csv`, and copies the download manifest. It does not create a ZIP and does not delete or modify the source files. Use a new request ID for each run (or `--clean`) so an earlier delivery is not mixed with a rerun.
 
-Review the tracker and exceptions report, then verify the ZIP can be read:
+Review the tracker and exceptions report and the document folders before delivery.
+
+### Upload to Teams-connected SharePoint
+
+The workflow calls `sharepoint_upload.py` automatically after the delivery check. Run it on its own to upload `output\<request-id>` (or a file/folder passed as an argument) again, for example after an upload error. It never overwrites: if a folder with the same name already exists at the destination, it stops. Files placed in a Teams channel's SharePoint folder appear in the channel's Files tab.
+
+The upload mode is set in `.env`; command-line options only override it for one run:
+
+| Setting | Values | Meaning |
+|---|---|---|
+| `SHAREPOINT_UPLOAD_METHOD` | `graph` / `sync` / `none` | Microsoft Graph upload / copy into the OneDrive-synced folder / no upload. Required. |
+| `SHAREPOINT_USE_PROXY` | `true` (default) / `false` | `graph` only: route Microsoft Graph calls through `VEEVA_PROXY`. |
+| `SHAREPOINT_AUTH` | `user` (default) / `app` | `graph` only: your own sign-in (Method 2) or app registration (Method 3). |
 
 ```powershell
-python -c "import zipfile; p=r'output\\LIT-001\\LIT-001_delivery.zip'; z=zipfile.ZipFile(p); print('ZIP OK' if z.testzip() is None else 'ZIP CORRUPT')"
+python sharepoint_upload.py                      # upload output\<request-id> per SHAREPOINT_UPLOAD_METHOD
+python sharepoint_upload.py --method sync        # one-off override
+python sharepoint_upload.py "<path>" --method graph --no-proxy
 ```
 
-Replace `LIT-001` in the verification command with the request ID used for this run. Review the ZIP contents and resolve exceptions before delivery.
+#### Method 1: OneDrive-synced folder (`SHAREPOINT_UPLOAD_METHOD=sync`)
 
-### Upload the ZIP to Teams-connected SharePoint
+1. Open the target SharePoint/Teams folder in the browser and choose **Add shortcut to OneDrive** (or **Sync**).
+2. Wait until the folder appears in File Explorer, for example `C:\Users\<user>\OneDrive - Bayer\Shortcuts\CF Internal - Veeva-valt-test`.
+3. Set it in `.env`:
 
-The upload is optional and separate from the end-to-end local packaging steps above. Only proceed after reviewing and approving the ZIP. Add these settings to the local `.env` file:
+   ```text
+   SHAREPOINT_UPLOAD_METHOD=sync
+   SHAREPOINT_SYNC_FOLDER=C:\Users\<user>\OneDrive - Bayer\Shortcuts\CF Internal - Veeva-valt-test
+   ```
+
+4. Run `python sharepoint_upload.py`. The script copies the folder and verifies every file size locally; the OneDrive client then syncs it. Confirm in SharePoint that the folder appears (OneDrive must be running and signed in).
+
+#### Method 2: Microsoft Graph with your own sign-in (`SHAREPOINT_UPLOAD_METHOD=graph`, `SHAREPOINT_AUTH=user`)
+
+No app registration is needed. The script uses the Microsoft Graph Command Line Tools public client (override with `SHAREPOINT_PUBLIC_CLIENT_ID`) and signs you in with your company account. `SHAREPOINT_LOGIN` selects how: `broker` (default; Windows account broker, satisfies device-based conditional access, requires `msal[broker]`), `browser` (system browser), or `device` (device code; often blocked by conditional access). The token is cached in `.msal_token_cache.json` (git-ignored; delete it to sign out). Uploads use the `VEEVA_PROXY` proxy unless `SHAREPOINT_USE_PROXY=false` (direct connection also tested on the Bayer network).
+
+```text
+SHAREPOINT_SHARE_URL=<"Copy link" URL of the target SharePoint folder>
+SHAREPOINT_LOGIN=broker
+SHAREPOINT_LOGIN_HINT=<your company e-mail>
+```
+
+If your organization's conditional-access policy still blocks sign-in for this client, use Method 1 or Method 3.
+
+Graph uploads verify each file's size in SharePoint. Office files (`.docx`, `.xlsx`, `.pptx`, ...) are exempt because SharePoint writes library metadata into them on upload. If an upload stops midway, delete the partial folder in SharePoint before rerunning.
+
+#### Method 3: Microsoft Graph with an app registration (`SHAREPOINT_UPLOAD_METHOD=graph`, `SHAREPOINT_AUTH=app`)
+
+For unattended use. Requires an approved Microsoft Entra app with Graph application permission `Sites.Selected` (granted on the site) or `Files.ReadWrite.All`, with admin consent:
 
 ```text
 AZURE_TENANT_ID=<Microsoft Entra tenant ID>
 AZURE_CLIENT_ID=<app registration client ID>
 AZURE_CLIENT_SECRET=<app registration client secret>
-SHAREPOINT_SITE_ID=<SharePoint site ID>
-SHAREPOINT_DRIVE_ID=<document library drive ID>
-SHAREPOINT_FOLDER_PATH=Approved/Veeva Deliveries
+SHAREPOINT_SHARE_URL=<folder link>   # or SHAREPOINT_DRIVE_ID + SHAREPOINT_FOLDER_PATH
 ```
-
-The app registration must have approved Microsoft Graph application permission `Files.ReadWrite.All` (or a more restricted approved permission) with admin consent. Upload the ZIP generated by the `.env` configuration:
-
-```powershell
-python sharepoint_upload.py
-```
-
-Or upload a specific ZIP:
-
-```powershell
-python sharepoint_upload.py "output\LIT-001\LIT-001_delivery.zip"
-```
-
-The uploader uses the SharePoint document library associated with the configured site and drive. It does not upload to a Teams chat directly; files in the channel's SharePoint folder appear in the Teams channel.
 
 ### Command parameters
 
@@ -607,7 +645,7 @@ output\LIT-001\
 │   └── file_without_document_number.pdf
 ├── collection_tracker.csv
 ├── exceptions_report.csv
-└── LIT-001_delivery.zip (also contains veeva_download_manifest.csv)
+└── veeva_download_manifest.csv
 ```
 
 Each document folder holds three files per version: `<Document Number>_v<Version>_Annotation.pdf`, `<Document Number>_v<Version>_audit_trail.pdf`, and `<Document Number>_v<Version>_<original source filename>`.
@@ -618,7 +656,7 @@ Each document folder holds three files per version: `<Document Number>_v<Version
 
 ### 13.1 Document folders
 
-Each identified document number gets one folder in the ZIP, and all of that document's files sit directly inside it (no subfolders):
+Each identified document number gets one folder in the delivery folder, and all of that document's files sit directly inside it (no subfolders):
 
 ```text
 DOC123456\
@@ -642,7 +680,7 @@ Columns:
 
 Open it in Excel to review the collection result.
 
-`veeva_download_manifest.csv` is written to the input folder and included in the delivery ZIP. It has one row per version with `status` (`DOWNLOADED`, `FAILED`, or `NOT_ATTEMPTED`), `error`, `annotation_status`, and `audit_status`, plus the Vault document ID and local file paths.
+`veeva_download_manifest.csv` is written to the input folder and copied into the delivery folder. It has one row per version with `status` (`DOWNLOADED`, `FAILED`, or `NOT_ATTEMPTED`), `error`, `annotation_status`, and `audit_status`, plus the Vault document ID and local file paths.
 
 ### 13.3 `exceptions_report.csv`
 
@@ -663,15 +701,15 @@ Correct those filenames manually, then rerun the script using a new request ID o
 
 Files without a document number are copied to this folder. They are not deleted or ignored.
 
-### 13.5 Delivery ZIP
+### 13.5 Delivery folder
 
-The final ZIP is created here:
+The final delivery is the folder:
 
 ```text
-output\LIT-001\LIT-001_delivery.zip
+output\LIT-001\
 ```
 
-It contains document folders, the tracker, the exceptions report, and the download manifest. Review the output before manually uploading the ZIP or its contents to the required customer Teams/SharePoint location.
+It contains document folders, the tracker, the exceptions report, and the download manifest. No ZIP is created. The workflow uploads this folder to SharePoint per `SHAREPOINT_UPLOAD_METHOD`; review it there.
 
 ---
 
@@ -706,7 +744,6 @@ output\LIT-DEMO\DOC234567\DOC234567_v2.1_source.pdf
 output\LIT-DEMO\Unmatched\notes.txt
 output\LIT-DEMO\collection_tracker.csv
 output\LIT-DEMO\exceptions_report.csv
-output\LIT-DEMO\LIT-DEMO_delivery.zip
 ```
 
 ---
@@ -772,17 +809,37 @@ DOC123456_v2.1_annotation.pdf
 
 ### Existing output must be replaced
 
-The workflow replaces the delivery ZIP when the same request ID is reused. Use a new request ID to preserve earlier deliveries. To discard the current working set before a fresh run, use `--clean` after confirming the configured input and output folders can be removed:
+Rerunning with the same request ID copies files into the existing delivery folder; files from an earlier run are not removed. Use a new request ID to preserve earlier deliveries. To discard the current working set before a fresh run, use `--clean` after confirming the configured input and output folders can be removed:
 
 ```powershell
 python run_veeva_workflow.py --clean
 ```
 
+### Error: `Signed in at <host> but Vault returned <other host>`
+
+The account has no access to the Vault in `AUTH_URL`, so Vault signed in to the account's default Vault. Nothing is downloaded. Request access to that Vault, use another account, or switch `AUTH_URL` (see section 7).
+
+### Error: `Already exists in SharePoint folder` / Graph `409 nameAlreadyExists`
+
+A folder named `<request-id>` already exists at the SharePoint destination; uploads never overwrite. Set a new `VEEVA_REQUEST_ID`, or delete the old folder in SharePoint, then upload the existing delivery without re-downloading:
+
+```powershell
+python sharepoint_upload.py
+```
+
+### Microsoft sign-in: `You don't have access to this`
+
+Conditional access blocked the sign-in method. Keep `SHAREPOINT_LOGIN=broker` (device-code sign-in is blocked on Bayer devices), or use `SHAREPOINT_UPLOAD_METHOD=sync`. Delete `.msal_token_cache.json` to sign in again.
+
+### Error: `Set SHAREPOINT_UPLOAD_METHOD in .env`
+
+The setting is missing or misspelled. Use `graph`, `sync`, or `none`.
+
 ---
 
 ## 16. Validation before delivery
 
-Before manually uploading the final package to Teams/SharePoint, complete this checklist:
+After the workflow uploads the delivery folder to SharePoint, complete this checklist:
 
 - [ ] Requested document numbers are present.
 - [ ] Required source documents and versions are present.
@@ -791,39 +848,40 @@ Before manually uploading the final package to Teams/SharePoint, complete this c
 - [ ] Annotation names use the required document/version format.
 - [ ] `exceptions_report.csv` is reviewed and resolved or accepted.
 - [ ] `collection_tracker.csv` is reviewed.
-- [ ] The delivery ZIP opens successfully.
-- [ ] The output is uploaded only to the approved customer destination.
+- [ ] The delivery folder contains one folder per requested document.
+- [ ] The output is uploaded only to the approved customer destination (`SHAREPOINT_SHARE_URL` / `SHAREPOINT_SYNC_FOLDER`).
 
 ---
 
 ## 17. Security and handling guidance
 
-- Do not store Veeva passwords, session cookies, or API tokens in this project.
+- Keep Veeva and proxy credentials only in the local, Git-ignored `.env`; never commit them or paste them into logs.
+- The Microsoft sign-in token is cached in `.msal_token_cache.json` (Git-ignored); delete it to sign out.
 - Treat manually exported litigation content according to applicable Bayer access, retention, and information-handling requirements.
 - Keep the input folder and output folder in approved local/network locations.
-- Review the delivery package before transferring it to Teams/SharePoint.
-- Do not share the output ZIP through unapproved channels.
+- Point the SharePoint settings only at approved destinations.
+- Do not share the delivery folder through unapproved channels.
 
 ---
 
 ## 18. Operator-performed steps
 
-The automation does not create the Veeva report and does not upload to SharePoint unless `sharepoint_upload.py` is run. Items Vault cannot return (listed in `exceptions_report.csv`) must be exported manually when required. Review the manifest, tracker, exceptions report, and ZIP before delivery.
+The automation does not create the Veeva report. Items Vault cannot return (listed in `exceptions_report.csv`) must be exported manually when required. Review the manifest, tracker, exceptions report, and uploaded delivery folder.
 
 ---
 
 ## 19. Summary
 
-The end-to-end automation retrieves the source versions, annotations, and audit trails listed by the client and prepares a local delivery package. Final transfer remains under operator control:
+The end-to-end automation retrieves the source versions, annotations, and audit trails listed by the client, prepares a verified delivery folder, and uploads it to SharePoint:
 
 ```text
 Read the client version list
         ↓
 Download source, annotations, and audit trails through the proxy
         ↓
-Organize input files and build a verified ZIP
+Organize input files into a verified delivery folder
         ↓
-Review tracker and exceptions
+Upload output\<request-id> to SharePoint (SHAREPOINT_UPLOAD_METHOD: graph / sync / none)
         ↓
-Use the delivery ZIP for approved manual Teams/SharePoint delivery
+Review tracker and exceptions in SharePoint
 ```

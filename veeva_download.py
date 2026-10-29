@@ -82,17 +82,29 @@ def authenticate(auth_url: str, username: str, password: str) -> tuple[str, str]
     if payload.get("responseStatus") != "SUCCESS":
         raise RuntimeError(f"Authentication failed: {payload}")
     session_id = payload["sessionId"]
-    vault_id = str(payload.get("vaultId", ""))
     vaults = payload.get("vaultIds", [])
-    vault = next((item for item in vaults if str(item.get("id")) == vault_id), None)
-    if vault is None and len(vaults) == 1:
-        vault = vaults[0]
+    available = ", ".join(f"{item.get('id')} ({urlparse(str(item.get('url', ''))).hostname})" for item in vaults)
+    wanted_id = os.environ.get("VEEVA_VAULT_ID", "").strip()
+    if wanted_id:
+        vault = next((item for item in vaults if str(item.get("id")) == wanted_id), None)
+        if vault is None:
+            raise RuntimeError(f"VEEVA_VAULT_ID={wanted_id} is not available to this user; available: {available}")
+    else:
+        vault_id = str(payload.get("vaultId", ""))
+        vault = next((item for item in vaults if str(item.get("id")) == vault_id), None)
+        if vault is None and len(vaults) == 1:
+            vault = vaults[0]
     if not vault or not vault.get("url"):
         raise RuntimeError("Authentication succeeded without a Vault API URL")
+    vault_id = str(vault.get("id"))
     api_root = vault["url"].rstrip("/")
     if not api_root.endswith("/api"):
         api_root += "/api"
-    print(f"Authenticated. vaultId={vault_id}; API host={urlparse(api_root).hostname}")
+    auth_host, api_host = urlparse(auth_url).hostname, urlparse(api_root).hostname
+    # Vault falls back to the user's default Vault when the requested one is not accessible.
+    if not wanted_id and api_host != auth_host:
+        raise RuntimeError(f"Signed in at {auth_host} but Vault returned {api_host}; this user has no access to {auth_host}. Available: {available}. Set VEEVA_VAULT_ID to use a listed Vault deliberately.")
+    print(f"Authenticated. vaultId={vault_id}; API host={api_host}")
     return session_id, api_root
 
 
@@ -268,7 +280,7 @@ def write_download_manifest(rows: list[dict[str, str]], input_folder: Path) -> N
 def main() -> None:
     load_env_file(Path(__file__).with_name(".env"))
     configure_proxy()
-    auth_url = os.environ.get("STAGE_AUTH_URL", "").strip() or required_config("AUTH_URL")
+    auth_url = required_config("AUTH_URL")
     api_version = os.environ.get("VEEVA_API_VERSION", "v26.2").strip()
     username = required_config("VEEVA_USERNAME")
     password = required_config("VEEVA_PASSWORD")

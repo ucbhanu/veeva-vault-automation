@@ -1,4 +1,4 @@
-"""Download client-listed Veeva versions, annotations, and audit trails, organize them, and create a delivery ZIP."""
+"""Download client-listed Veeva versions, annotations, and audit trails, and organize them into a delivery folder."""
 from __future__ import annotations
 
 import argparse
@@ -6,7 +6,7 @@ import csv
 import errno
 import os
 import shutil
-import zipfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,7 @@ import openpyxl
 import requests
 
 import veeva_download as downloader
+import sharepoint_upload
 import zip_creator as organizer
 
 ROOT = Path(__file__).resolve().parent
@@ -88,7 +89,15 @@ def write_manifest(rows: list[dict[str, str]], input_folder: Path) -> Path:
         writer = csv.DictWriter(handle, fieldnames=downloader.MANIFEST_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
-    temporary.replace(manifest)
+    # Antivirus/indexers briefly lock freshly written files on Windows.
+    for attempt in range(10):
+        try:
+            temporary.replace(manifest)
+            break
+        except PermissionError:
+            if attempt == 9:
+                raise PermissionError(f"Cannot replace {manifest}; close it if it is open in Excel") from None
+            time.sleep(1)
     return manifest
 
 
@@ -135,7 +144,7 @@ def fetch_annotation_and_audit(api_root: str, api_version: str, session_id: str,
             result["audit_status"] = f"FAILED: {error}"
 
 
-def run(clean: bool = False, start_index: int = 1, end_index: int | None = None, package: bool = True) -> int:
+def run(clean: bool = False, start_index: int = 1, end_index: int | None = None, package: bool = True, upload: str | None = None, upload_proxy: bool | None = None) -> int:
     downloader.load_env_file(ROOT / ".env")
     downloader.configure_proxy()
     input_folder = project_path(downloader.required_config("VEEVA_INPUT_FOLDER"))
@@ -162,7 +171,7 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
         print("Cleaned project input/output folders.")
 
     previous = read_previous_manifest(input_folder / "veeva_download_manifest.csv")
-    auth_url = os.environ.get("STAGE_AUTH_URL", "").strip() or downloader.required_config("AUTH_URL")
+    auth_url = downloader.required_config("AUTH_URL")
     api_version = os.environ.get("VEEVA_API_VERSION", "v26.2").strip()
     session_id, api_root = downloader.authenticate(auth_url, downloader.required_config("VEEVA_USERNAME"), downloader.required_config("VEEVA_PASSWORD"))
     downloader.get_metadata(api_root, api_version, session_id)
@@ -219,17 +228,18 @@ def run(clean: bool = False, start_index: int = 1, end_index: int | None = None,
     if downloaded == 0:
         raise RuntimeError("No source files downloaded; refusing to package an empty delivery")
 
-    delivery = organizer.process(input_folder, request_id, output_root, copy_files=False)
-    zip_path = delivery / f"{request_id}_delivery.zip"
-    with zipfile.ZipFile(zip_path) as archive:
-        bad_member = archive.testzip()
-        if bad_member:
-            raise RuntimeError(f"ZIP integrity check failed at {bad_member}")
-        entry_count = len(archive.namelist())
+    delivery = organizer.process(input_folder, request_id, output_root)
+    with (delivery / "collection_tracker.csv").open(newline="", encoding="utf-8") as handle:
+        copied = list(csv.DictReader(handle))
+    mismatched = [row["output_file"] for row in copied if not Path(row["output_file"]).is_file() or Path(row["output_file"]).stat().st_size != Path(row["source_file"]).stat().st_size]
+    if mismatched:
+        raise RuntimeError(f"Delivery copy check failed for: {', '.join(mismatched)}")
     print(f"Delivery folder: {delivery}")
-    print(f"Delivery ZIP: {zip_path}")
-    print(f"ZIP integrity: OK ({entry_count} entries)")
+    print(f"Delivery check: OK ({len(copied)} files)")
     print(f"Download failures or not attempted: {len(documents) - downloaded}")
+    destination = sharepoint_upload.deliver(delivery, upload, upload_proxy)
+    if destination:
+        print(f"SharePoint ({sharepoint_upload.upload_method(upload)}): {destination}")
     return 0 if downloaded == len(documents) and not storage_full else 1
 
 
@@ -239,8 +249,15 @@ def main() -> None:
     parser.add_argument("--start-index", type=int, default=1, help="First 1-based workbook row to process")
     parser.add_argument("--end-index", type=int, help="Last 1-based workbook row to process")
     parser.add_argument("--no-package", action="store_true", help="Download/checkpoint only; package in a later run")
+    parser.add_argument("--upload", choices=sharepoint_upload.UPLOAD_METHODS, help="Override SHAREPOINT_UPLOAD_METHOD from .env (graph, sync, none)")
+    parser.add_argument("--upload-no-proxy", action="store_true", help="Override SHAREPOINT_USE_PROXY: no VEEVA_PROXY for the Graph upload")
     args = parser.parse_args()
-    raise SystemExit(run(args.clean, args.start_index, args.end_index, not args.no_package))
+    downloader.load_env_file(ROOT / ".env")
+    try:
+        upload = sharepoint_upload.upload_method(args.upload)
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    raise SystemExit(run(args.clean, args.start_index, args.end_index, not args.no_package, upload, False if args.upload_no_proxy else None))
 
 
 if __name__ == "__main__":
